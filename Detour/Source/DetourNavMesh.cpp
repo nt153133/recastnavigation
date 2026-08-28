@@ -261,7 +261,11 @@ dtStatus dtNavMesh::init(const dtNavMeshParams* params)
 	// Only allow 31 salt bits, since the salt mask is calculated using 32bit uint and it will overflow.
 	m_saltBits = dtMin((unsigned int)31, 32 - m_tileBits - m_polyBits);
 
-	if (m_saltBits < 10)
+	// Salt guards stale refs across removeTile/addTile cycles. This stack loads static meshes once and
+	// models dynamic obstacles on the query filter (tiles are never removed at runtime), so 6 bits is
+	// ample — freeing ref bits for dense-zone budgets (e3f1 needs 13 tile + 11 poly = 24; upstream's
+	// 10-salt floor caps tile+poly at 22 and silently drops >maxPolys tiles at addTile).
+	if (m_saltBits < 6)
 		return DT_FAILURE | DT_INVALID_PARAM;
 #endif
 	
