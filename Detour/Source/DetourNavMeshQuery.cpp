@@ -21,6 +21,10 @@
 #include "DetourNavMeshQuery.h"
 #include "DetourNavMesh.h"
 #include "DetourNode.h"
+#include <queue>
+#include <unordered_map>
+#include <vector>
+#include <functional>
 #include "DetourCommon.h"
 #include "DetourMath.h"
 #include "DetourAlloc.h"
@@ -1162,6 +1166,182 @@ dtStatus dtNavMeshQuery::findPath(dtPolyRef startRef, dtPolyRef endRef,
 		status |= DT_OUT_OF_NODES;
 	
 	return status;
+}
+
+dtStatus dtNavMeshQuery::findPathToAny(dtPolyRef startRef, const float* startPos,
+	const dtPolyRef* goalRefs, const float* goalPositions, int goalCount,
+	const dtQueryFilter* filter, dtPolyRef* path, int* pathCount, int maxPath,
+	int* selectedGoal, float* pathCost) const
+{
+	if (!pathCount || !selectedGoal || !pathCost)
+		return DT_FAILURE | DT_INVALID_PARAM;
+	*pathCount = 0;
+	*selectedGoal = -1;
+	*pathCost = FLT_MAX;
+	if (!m_nav || !m_nodePool || !startPos || !dtVisfinite(startPos) ||
+		!goalRefs || !goalPositions || goalCount < 1 || goalCount > 8 ||
+		!filter || !path || maxPath < 1 || !isValidPolyRef(startRef, filter))
+		return DT_FAILURE | DT_INVALID_PARAM;
+
+	bool validGoal[8] = {};
+	bool anyGoal = false;
+	for (int i = 0; i < goalCount; ++i)
+	{
+		if (!dtVisfinite(goalPositions + i * 3))
+			return DT_FAILURE | DT_INVALID_PARAM;
+		validGoal[i] = goalRefs[i] && isValidPolyRef(goalRefs[i], filter);
+		anyGoal |= validGoal[i];
+	}
+	if (!anyGoal)
+		return DT_FAILURE;
+
+	// A state represents entry through a particular neighbouring polygon. Unlike findPath's
+	// poly-only state, changing the parent cannot leave an unrelated first-visit portal position.
+	// Each state has a fixed position; all filter-weighted edge costs are therefore stable.
+	struct Key
+	{
+		dtPolyRef previous, current;
+		bool operator==(const Key& other) const
+		{ return previous == other.previous && current == other.current; }
+	};
+	struct Hash
+	{
+		size_t operator()(const Key& key) const
+		{ return std::hash<dtPolyRef>()(key.previous) ^ (std::hash<dtPolyRef>()(key.current) << 1); }
+	};
+	struct Node
+	{
+		Key key;
+		float position[3];
+		float cost;
+		int parent;
+	};
+	const int maxNodes = m_nodePool->getMaxNodes();
+	std::vector<Node> nodes;
+	nodes.reserve(dtMin(maxNodes, 256));
+	std::unordered_map<Key, int, Hash> indices;
+	indices.reserve(dtMin(maxNodes, 256));
+	typedef std::pair<float, int> Entry;
+	std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry> > open;
+	Node start = {};
+	start.key = {0, startRef};
+	dtVcopy(start.position, startPos);
+	start.cost = 0;
+	start.parent = -1;
+	nodes.push_back(start);
+	indices[start.key] = 0;
+	open.push(Entry(0.0f, 0));
+
+	int bestGoal = -1;
+	int bestNode = -1;
+	float bestCost = FLT_MAX;
+	float bestDistance = FLT_MAX;
+	while (!open.empty())
+	{
+		const Entry entry = open.top();
+		open.pop();
+		if (entry.first > bestCost)
+			break;
+		// Copy: growing nodes while visiting neighbours may invalidate vector references.
+		const Node current = nodes[entry.second];
+		if (entry.first != current.cost)
+			continue;
+		const dtMeshTile* tile = 0;
+		const dtPoly* poly = 0;
+		m_nav->getTileAndPolyByRefUnsafe(current.key.current, &tile, &poly);
+		const dtMeshTile* previousTile = 0;
+		const dtPoly* previousPoly = 0;
+		if (current.key.previous)
+			m_nav->getTileAndPolyByRefUnsafe(current.key.previous, &previousTile, &previousPoly);
+
+		for (int i = 0; i < goalCount; ++i)
+		{
+			if (!validGoal[i] || goalRefs[i] != current.key.current)
+				continue;
+			const float* goal = goalPositions + i * 3;
+			const float terminal = filter->getCost(current.position, goal,
+				current.key.previous, previousTile, previousPoly,
+				current.key.current, tile, poly, 0, 0, 0);
+			const float cost = current.cost + terminal;
+			if (!(terminal >= 0) || !(cost < FLT_MAX))
+				return DT_FAILURE | DT_INVALID_PARAM;
+			const float distance = dtVdistSqr(startPos, goal);
+			if (cost < bestCost || (cost == bestCost && distance < bestDistance))
+			{
+				bestGoal = i;
+				bestNode = entry.second;
+				bestCost = cost;
+				bestDistance = distance;
+			}
+		}
+
+		for (unsigned int link = poly->firstLink; link != DT_NULL_LINK; link = tile->links[link].next)
+		{
+			const dtPolyRef nextRef = tile->links[link].ref;
+			if (!nextRef || nextRef == current.key.previous)
+				continue;
+			const dtMeshTile* nextTile = 0;
+			const dtPoly* nextPoly = 0;
+			m_nav->getTileAndPolyByRefUnsafe(nextRef, &nextTile, &nextPoly);
+			if (!filter->passFilter(nextRef, nextTile, nextPoly))
+				continue;
+			float portal[3];
+			if (dtStatusFailed(getEdgeMidPoint(current.key.current, poly, tile,
+				nextRef, nextPoly, nextTile, portal)))
+				continue;
+			const float edgeCost = filter->getCost(current.position, portal,
+				current.key.previous, previousTile, previousPoly,
+				current.key.current, tile, poly, nextRef, nextTile, nextPoly);
+			const float cost = current.cost + edgeCost;
+			if (!(edgeCost >= 0) || !(cost < FLT_MAX))
+				return DT_FAILURE | DT_INVALID_PARAM;
+			if (cost > bestCost)
+				continue;
+			const Key key = {current.key.current, nextRef};
+			auto found = indices.find(key);
+			int index;
+			if (found == indices.end())
+			{
+				// Losing any frontier node prevents proof that the incumbent is cheapest.
+				if ((int)nodes.size() == maxNodes)
+					return DT_FAILURE | DT_OUT_OF_NODES;
+				index = (int)nodes.size();
+				Node next = {};
+				next.key = key;
+				dtVcopy(next.position, portal);
+				next.cost = cost;
+				next.parent = entry.second;
+				nodes.push_back(next);
+				indices[key] = index;
+			}
+			else
+			{
+				index = found->second;
+				if (cost >= nodes[index].cost)
+					continue;
+				nodes[index].cost = cost;
+				nodes[index].parent = entry.second;
+			}
+			open.push(Entry(cost, index));
+		}
+	}
+	if (bestGoal < 0)
+		return DT_FAILURE | DT_PARTIAL_RESULT;
+	int length = 0;
+	for (int i = bestNode; i >= 0; i = nodes[i].parent)
+		++length;
+	if (length > maxPath)
+		return DT_FAILURE | DT_BUFFER_TOO_SMALL;
+	int index = bestNode;
+	for (int i = length - 1; i >= 0; --i)
+	{
+		path[i] = nodes[index].key.current;
+		index = nodes[index].parent;
+	}
+	*pathCount = length;
+	*selectedGoal = bestGoal;
+	*pathCost = bestCost;
+	return DT_SUCCESS;
 }
 
 dtStatus dtNavMeshQuery::getPathToNode(dtNode* endNode, dtPolyRef* path, int* pathCount, int maxPath) const

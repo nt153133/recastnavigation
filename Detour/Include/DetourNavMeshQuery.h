@@ -192,6 +192,14 @@ public:
 					  const dtQueryFilter* filter,
 					  dtPolyRef* path, int* pathCount, const int maxPath) const;
 
+	/// One bounded Dijkstra search to the cheapest of up to eight exact endpoints.
+	/// Incoming portals are distinct states so the terminal cost uses the actual entry side.
+	/// Zero goal refs are ignored. Failure never returns a partial corridor or selected goal.
+	dtStatus findPathToAny(dtPolyRef startRef, const float* startPos,
+		const dtPolyRef* goalRefs, const float* goalPositions, int goalCount,
+		const dtQueryFilter* filter, dtPolyRef* path, int* pathCount, int maxPath,
+		int* selectedGoal, float* pathCost) const;
+
 	/// Finds the straight path from the start to the end position within the polygon corridor.
 	///  @param[in]		startPos			Path start position. [(x, y, z)]
 	///  @param[in]		endPos				Path end position. [(x, y, z)]
