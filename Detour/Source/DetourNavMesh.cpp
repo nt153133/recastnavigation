@@ -680,6 +680,33 @@ void closestPointOnDetailEdges(const dtMeshTile* tile, const dtPoly* poly, const
 		}
 	}
 
+	// llama-patches: a detail mesh can carry no boundary-flagged edge at all (2 polys in the 2026-09 FFXIV
+	// corpus: y6f3, n4f2), which left pmin/pmax null and crashed dtVlerp for any query point outside such a
+	// poly. Fall back to the polygon outline, which always exists; if even that finds nothing (non-finite
+	// input), leave the query position unchanged.
+	if (!pmin)
+	{
+		for (int k = 0, j = poly->vertCount - 1; k < poly->vertCount; j = k++)
+		{
+			const float* va = &tile->verts[poly->verts[j] * 3];
+			const float* vb = &tile->verts[poly->verts[k] * 3];
+			float t;
+			const float d = dtDistancePtSegSqr2D(pos, va, vb, t);
+			if (d < dmin)
+			{
+				dmin = d;
+				tmin = t;
+				pmin = va;
+				pmax = vb;
+			}
+		}
+	}
+	if (!pmin)
+	{
+		dtVcopy(closest, pos);
+		return;
+	}
+
 	dtVlerp(closest, pmin, pmax, tmin);
 }
 }
